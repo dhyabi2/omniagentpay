@@ -40,8 +40,13 @@ style and needs only ``httpx`` (already a project dependency).
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import secrets
+import sqlite3
+import time
 from dataclasses import dataclass
 from decimal import ROUND_CEILING, Decimal
+from urllib.parse import urlparse
 
 import httpx
 
@@ -110,13 +115,38 @@ async def fetch_xno_usd() -> Decimal:
         return Decimal("0.55")  # recent published fallback; clearly labelled
 
 
+RPC_TIMEOUT_S = 10
+RPC_MAX_BYTES = 64 * 1024
+
+
+def assert_safe_rpc_url(url: str) -> None:
+    """https, or plain http only to a loopback host; anything else is refused."""
+    u = urlparse(url)
+    if not (u.scheme == "https" or (u.scheme == "http" and u.hostname in ("localhost", "127.0.0.1", "::1"))):
+        raise ValueError("Nano RPC URL must be https (plain http only for loopback)")
+
+
+async def _block_info(client: httpx.AsyncClient, url: str, block_hash: str) -> dict:
+    """One bounded block_info lookup: safe URL, timeout, response size cap."""
+    assert_safe_rpc_url(url)
+    r = await client.post(url, json={"action": "block_info", "json_block": "true", "hash": block_hash})
+    r.raise_for_status()
+    if len(getattr(r, "content", b"")) > RPC_MAX_BYTES:
+        raise ValueError("Nano RPC response too large")
+    return r.json()
+
+
 async def verify_nano_payment(
     block_hash: str,
     expected_payee: str,
     expected_amount_raw: int,
     rpc_urls: list[str] | None = None,
 ) -> dict:
-    """Verify a Nano send on >=2 independent public RPCs. FAILS CLOSED.
+    """UNBOUND read of a block: checks payee and amount only, and does not know which
+    order the block pays for or whether it was already used. Use
+    ``verify_order_payment`` to gate a service.
+
+    Verify a Nano send on >=2 independent public RPCs. FAILS CLOSED.
 
     Returns a dict with ``ok``, the list of endpoints that confirmed, and the
     first reason if any endpoint refused. A payment is only considered settled
@@ -130,15 +160,10 @@ async def verify_nano_payment(
     confirmed: list[str] = []
     reasons: list[str] = []
 
-    async with httpx.AsyncClient(timeout=10) as client:
+    async with httpx.AsyncClient(timeout=RPC_TIMEOUT_S) as client:
         for url in rpc_urls:
             try:
-                r = await client.post(
-                    url,
-                    json={"action": "block_info", "json_block": "true", "hash": block_hash},
-                )
-                r.raise_for_status()
-                data = r.json()
+                data = await _block_info(client, url, block_hash)
             except Exception as exc:  # network error, 4xx/5xx, bad JSON
                 reasons.append(f"{url}: {exc}")
                 continue
@@ -174,6 +199,121 @@ async def verify_nano_payment(
     }
 
 
+# ---- Order-bound verification (xno-call-binding option C + seller ledger rules) --------
+# A Nano block has no memo, so "a confirmed send of the right amount exists" does not say
+# which order it paid. Each order gets a random id and a commitment the buyer signs into the
+# send block's ``representative``; the block hash is then claimed one-to-one with the order in
+# sqlite (UNIQUE, so it survives a restart) before the service is released.
+_B32 = "13456789abcdefghijkmnopqrstuwxyz"
+
+
+def order_commitment(order_id: str, pay_to: str, price_raw: int) -> bytes:
+    """SHA-256("xno-binding/v1/rep|" + order_id + "|" + pay_to + "|" + price_raw)."""
+    msg = b"xno-binding/v1/rep|" + order_id.encode() + b"|" + pay_to.encode() + b"|" + str(int(price_raw)).encode()
+    return hashlib.sha256(msg).digest()
+
+
+def account_to_pubkey(addr: str) -> bytes | None:
+    """32-byte public key of a nano_ account (checksum verified), or None."""
+    if not isinstance(addr, str) or not addr.startswith(("nano_", "xrb_")):
+        return None
+    body = addr.split("_", 1)[1]
+    if len(body) != 60 or any(c not in _B32 for c in body):
+        return None
+    n = 0
+    for ch in body:
+        n = n * 32 + _B32.index(ch)
+    if n >> 296:
+        return None
+    key = (n >> 40).to_bytes(32, "big")
+    if hashlib.blake2b(key, digest_size=5).digest()[::-1] != (n & ((1 << 40) - 1)).to_bytes(5, "big"):
+        return None
+    return key
+
+
+def init_ledger(conn: sqlite3.Connection) -> None:
+    conn.execute("create table if not exists nano_orders(order_id text primary key, pay_to text, "
+                 "price_raw text, expires integer)")
+    conn.execute("create table if not exists nano_claims(block_hash text primary key, "
+                 "order_id text unique, claimed_at integer)")
+    conn.commit()
+
+
+def issue_order(conn: sqlite3.Connection, pay_to: str, price_raw: int, ttl_s: int = 600) -> dict:
+    """Open an order with an opaque 128-bit id; give the buyer ``representative_pubkey``."""
+    init_ledger(conn)
+    order_id = secrets.token_hex(16)
+    expires = int(time.time()) + ttl_s
+    with conn:
+        conn.execute("insert into nano_orders values(?,?,?,?)", (order_id, pay_to, str(price_raw), expires))
+    return {"order_id": order_id, "pay_to": pay_to, "price_raw": str(price_raw), "expires": expires,
+            "representative_pubkey": order_commitment(order_id, pay_to, price_raw).hex()}
+
+
+def _bound_ok(data: dict, pay_to: str, price_raw: int, order_id: str) -> str:
+    """Empty string if this node's answer binds the block to the order, else the reason."""
+    contents = data.get("contents") or {}
+    if str(data.get("confirmed")).lower() != "true":
+        return "block not confirmed"
+    if data.get("subtype") != "send":
+        return "block is not a send"
+    if contents.get("link_as_account") != pay_to:
+        return "paid to wrong address"
+    if str(data.get("amount")) != str(price_raw):
+        return "amount does not match the order"
+    rep = account_to_pubkey(contents.get("representative", ""))
+    if rep is None or rep != order_commitment(order_id, pay_to, price_raw):
+        return "block is not bound to this order"
+    return ""
+
+
+async def verify_order_payment(
+    conn: sqlite3.Connection,
+    order_id: str,
+    block_hash: str,
+    rpc_urls: list[str] | None = None,
+    now: int | None = None,
+) -> dict:
+    """FAILS CLOSED. Releases only for a confirmed send of exactly the order's price to its
+    pay_to, carrying this order's commitment, on every queried node, and whose hash is not
+    claimed by another order. The claim is written before the result is returned."""
+    init_ledger(conn)
+    rpc_urls = rpc_urls or DEFAULT_RPC_URLS
+    if len(rpc_urls) < 2:
+        return {"ok": False, "reason": f"need >=2 independent RPCs, got {len(rpc_urls)}"}
+    if not (isinstance(block_hash, str) and len(block_hash) == 64 and all(c in "0123456789abcdefABCDEF" for c in block_hash)):
+        return {"ok": False, "reason": "invalid block hash"}
+    block_hash = block_hash.upper()
+    row = conn.execute("select pay_to, price_raw, expires from nano_orders where order_id=?", (str(order_id),)).fetchone()
+    if row is None:
+        return {"ok": False, "reason": "unknown order"}
+    pay_to, price_raw, expires = row[0], int(row[1]), int(row[2])
+    done = conn.execute("select block_hash from nano_claims where order_id=?", (order_id,)).fetchone()
+    if done is not None:
+        same = done[0] == block_hash
+        return {"ok": same, "reason": "" if same else "order already paid by another block"}
+    if (now if now is not None else int(time.time())) > expires:
+        return {"ok": False, "reason": "order expired"}
+    if conn.execute("select 1 from nano_claims where block_hash=?", (block_hash,)).fetchone():
+        return {"ok": False, "reason": "block already claimed by another order"}
+
+    async with httpx.AsyncClient(timeout=RPC_TIMEOUT_S) as client:
+        for url in rpc_urls:
+            try:
+                data = await _block_info(client, url, block_hash)
+            except Exception as exc:
+                return {"ok": False, "reason": f"{url}: {exc}"}
+            why = _bound_ok(data, pay_to, price_raw, order_id)
+            if why:
+                return {"ok": False, "reason": f"{url}: {why}"}
+    try:
+        with conn:  # UNIQUE(block_hash) and UNIQUE(order_id): the claim is atomic
+            conn.execute("insert into nano_claims values(?,?,?)", (block_hash, order_id, int(time.time())))
+    except sqlite3.IntegrityError:
+        return {"ok": False, "reason": "block already claimed by another order"}
+    return {"ok": True, "reason": ""}
+
+
 async def main() -> None:
     print("=" * 64)
     print("Nano (XNO) settlement leg for OmniAgentPay")
@@ -198,7 +338,8 @@ async def main() -> None:
 
     # 3) Verify a real Nano send across two independent public RPCs.
     print(f"\n3) Verifying on-chain send {DEMO_BLOCK_HASH[:24]}…")
-    print("   (two independent public RPCs, fail-closed)")
+    print("   (two independent public RPCs, fail-closed; an UNBOUND read of the block -")
+    print("    gate a service with verify_order_payment, which also needs the order commitment)")
     result = await verify_nano_payment(
         block_hash=DEMO_BLOCK_HASH,
         expected_payee=reqs.payee,
